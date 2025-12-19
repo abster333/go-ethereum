@@ -3,20 +3,20 @@
 ## Executive Summary
 This assessment focused on the Go-Ethereum (Geth) codebase, specifically targeting high-severity vulnerabilities in the P2P networking, Transaction Pool, and RPC subsystems.
 
-A **High-Severity Denial of Service (DoS)** vulnerability was identified in the handling of Blob Transactions (EIP-4844). Attackers can exploit this to exhaust node CPU resources by spamming invalid blob transactions, which trigger expensive KZG verifications before the node applies any effective mitigation (peer dropping).
+A **High-Severity Denial of Service (DoS)** vulnerability was identified in the handling of Blob Transactions (EIP-4844). Attackers can exploit this to exhaust node CPU resources by spamming invalid blob transactions, which trigger expensive KZG verifications before any effective mitigation (disconnect/ban) is applied.
 
 ## Findings
 
 ### [HIGH] CPU Exhaustion via Invalid Blob Transaction Spam
 
 **Severity:** High
-**Component:** `eth/fetcher`, `core/txpool/blobpool`
-**Affected Versions:** Confirmed in Geth commit `03138851`. Likely affects any release line where `PooledTransactionsMsg` (0x0a) can be accepted unsolicited and forwarded into txpool validation (eth/68+).
+**Component:** `eth/protocols/eth`, `eth/handler_eth`, `eth/fetcher`, `core/txpool` (blob validation)
+**Affected Versions:** Reproduced against go-ethereum source commit `3f02256db` (this checkout). Likely affects any release line where `PooledTransactionsMsg` (0x0a) is accepted and forwarded into txpool stateless validation without being tied to an outstanding `GetPooledTransactionsMsg` request (eth/68+).
 
 #### Description
 The Geth node allows peers to push transactions via `PooledTransactionsMsg` (0x0a) messages. The `eth` protocol handler accepts these messages even if they were not explicitly requested (unsolicited push). When processing these transactions, the `TxFetcher` enqueues them into the `TxPool`.
 
-The `TxPool.Add` method performs validation, including the computationally expensive KZG proof verification for Blob Transactions (`VerifyBlobProof`). This verification happens in the `preCheck` phase, which is designed to be lock-free to avoid stalling the pool. However, because this verification is performed **synchronously** in the peer's message handler goroutine *before* any effective rate-limiting or peer dropping occurs, it allows an attacker to force the victim to consume significant CPU resources.
+The txpool’s stateless validation performs computationally expensive KZG proof verification for blob transactions (`kzg4844.VerifyBlobProof`). In the current `eth` handling path, this expensive work is performed **synchronously** in the peer’s message handling flow, and repeated invalid proofs are not treated as a protocol violation (no disconnect/ban), enabling CPU exhaustion by an untrusted peer.
 
 If the verification fails (e.g., due to an invalid proof), the `TxFetcher` counts the rejection but **does not drop the peer**. Instead, it applies a short sleep (200ms) if the rejection rate is high. This throttling is insufficient to prevent CPU exhaustion, as the expensive work (KZG verification) is already completed before the sleep.
 
@@ -71,37 +71,42 @@ An attacker can establish multiple P2P connections and spam `PooledTransactionsM
         }
     }
     ```
-    Crucially, `otherreject` only triggers a 200ms sleep, not a peer disconnect.
+    Crucially:
+    - Validation errors returned by `addTxs` are not propagated as a protocol-level error (so the peer is not disconnected by `handleMessage`).
+    - `otherreject` only triggers a 200ms sleep, not a peer disconnect/ban.
 
-4.  **Validation (`core/txpool/blobpool/blobpool.go`):**
-    The `BlobPool.Add` method calls `preCheck` for each transaction. `preCheck` performs the expensive `ValidateTxBasics` -> `validateBlobTx` -> `VerifyBlobProof` chain.
-    ```go
-    // core/txpool/blobpool/blobpool.go
-    func (p *BlobPool) Add(txs []*types.Transaction, sync bool) []error {
-        // ...
-        for i, tx := range txs {
-            // Expensive KZG verification happens here, outside the lock
-            if errs[i] = p.preCheck(tx); errs[i] != nil {
-                continue
-            }
-            // ...
-        }
-        // ...
-    }
+4.  **Backend Handler (`eth/handler_eth.go`):**
+    Pooled transactions are handled as “direct” deliveries (`direct=true`). There are explicit disconnect-triggering checks for missing sidecars and commitment-hash mismatch, but **no** KZG proof verification at this layer:
+    - Sidecar-less blob tx => error (disconnect)
+    - Commitment-hash mismatch => error (disconnect)
+    - Invalid KZG proof => not checked here; falls through into txpool validation
 
-    // preCheck calls ValidateTxBasics -> ValidateTransaction -> validateBlobTx -> VerifyBlobProof
-    func (p *BlobPool) preCheck(tx *types.Transaction) error {
-        // ...
-        if err := p.ValidateTxBasics(tx); err != nil {
-            return err
-        }
-        // ...
-    }
-    ```
-    While `preCheck` is lock-free, it consumes CPU. Since this runs in the peer's handler goroutine, an attacker with multiple connections can saturate multiple CPU cores.
+5.  **Stateless Validation (`core/txpool/validation.go`):**
+    For legacy blob sidecars, the expensive proof verification happens in `validateBlobSidecarLegacy`:
+    - `kzg4844.VerifyBlobProof(&sidecar.Blobs[i], sidecar.Commitments[i], sidecar.Proofs[i])`
+    This is invoked from the blob pool’s lock-free precheck path via:
+    - `core/txpool/blobpool/blobpool.go: ValidateTxBasics -> txpool.ValidateTransaction`
 
-5.  **Late Check (`eth/fetcher/tx_fetcher.go`):**
+6.  **Late Check (`eth/fetcher/tx_fetcher.go`):**
     The `cleanup` channel is processed asynchronously. Only *after* the transactions have been validated and added (or rejected) does the fetcher check `f.requests[delivery.origin]`. If no request exists, it logs a warning but does not retroactively undo the CPU work.
+
+**Why the peer stays connected (code-level):**
+`eth/protocols/eth/handler.go` documents that the remote connection is torn down upon returning any error from a message handler. In this path, invalid blob proofs result in txpool validation errors, but those are not returned as handler errors; `TxFetcher.Enqueue` accepts the batch, records rejection statistics, and returns `nil`. As a result, repeated invalid proofs do not trigger disconnect/ban at the protocol level.
+
+#### Why this differs from “just sending invalid junk”
+There are many protocol and implementation guards that make *other* classes of invalid data cheap to reject or disconnect-worthy. This blob-proof case stands out because it is **expensive per-item**, **easy to make well-formed**, and **not penalized as a protocol violation**.
+
+Concrete examples of existing guards (contrast cases):
+* **Oversized messages are rejected early:** `eth/protocols/eth/handler.go` enforces `maxMessageSize` (10 MiB) and disconnects on violation before higher-level decoding/processing.
+* **Malformed / duplicate tx deliveries can disconnect:** `eth/protocols/eth/handlers.go` rejects nil txs and duplicate tx hashes as errors in both `handleTransactions` and `handlePooledTransactions` (handler error => disconnect).
+* **Many responses are tied to an explicit request/response dispatcher:** `eth/protocols/eth/dispatcher.go` treats “dangling responses” (untracked request IDs) as protocol errors. However, `handlePooledTransactions` does not use the dispatcher; it calls `requestTracker.Fulfil` (metrics) and forwards unconditionally, so unsolicited `PooledTransactionsMsg` is not treated as a protocol violation.
+* **Blob txs are intentionally not accepted as broadcasts:** `eth/handler_eth.go` rejects blob transactions delivered via `TransactionsMsg` (“broadcast”) as a handler error (disconnect). The intent is that blob txs should be **pulled** (requested) rather than **pushed**.
+* **Some blob-sidecar invalidity is treated as disconnect-worthy:** `eth/handler_eth.go` disconnects for missing sidecars or commitment-hash mismatch (cheap checks), but it does **not** verify KZG proofs at this layer.
+* **Fetcher has DoS protections for the announce→request path:** `eth/fetcher/tx_fetcher.go` includes per-peer announce caps (`maxTxAnnounces`) and retrieval sizing controls (`maxTxRetrievalSize`), but unsolicited `PooledTransactionsMsg` bypasses that “pull-based” flow and lands directly in txpool validation.
+
+What makes this specific attack path strong:
+* The attacker can craft blob txs that pass the cheap disconnect checks (sidecar present + commitment-hash matches) and then reliably force the expensive KZG verification to run and fail.
+* The failure is counted as an “other reject” and only triggers a small post-hoc sleep under certain ratios; there is no “proof-invalid => disconnect/ban” policy.
 
 #### Impact Analysis & Exploit Economics
 
@@ -112,7 +117,7 @@ An attacker can flood a victim node with unsolicited `PooledTransactionsMsg` con
 *   **Bandwidth Limit:** The `eth` protocol enforces `maxMessageSize = 10 * 1024 * 1024` bytes (10 MiB). This cap is applied to `msg.Size` during `eth` message handling.
 *   **Blob Tx Size (Wire Format):** A single blob transaction with a populated sidecar is ~131KB when RLP-encoded in “network encoding” (exact size varies by signature and list overhead). This was measured locally using `rlp.EncodeToBytes` in `measure_tx_size.go` / `bug-bounty/poc_packet_gen.go`.
 *   **Payload Capacity:** A full 10 MiB message can typically fit on the order of **~70–80** one-blob transactions, depending on overhead.
-*   **CPU Cost (Benchmark):** On the target system, `kzg4844.VerifyBlobProof` costs **~2.5ms per blob**. This cost is paid even if the proof is invalid but well-formed.
+*   **CPU Cost (Benchmark):** On this test machine, a single invalid-proof blob tx validation took ~`1.8ms` (see “Local Reproduction (No Network)”). This cost is paid even if the proof is invalid but well-formed.
 
 **Mitigation factor (and how attackers work around it):**
 *   `TxFetcher.Enqueue` processes incoming txs in batches of `addTxsBatchSize = 128`.
@@ -121,9 +126,9 @@ An attacker can flood a victim node with unsolicited `PooledTransactionsMsg` con
 *   An attacker can avoid triggering the sleep by keeping each delivered batch at **≤32 invalid-proof txs** (e.g., send messages containing ≤32 blob txs, or otherwise ensure the invalid-proof rate stays under the threshold).
 
 **Amplification (illustrative):**
-*   If an attacker sends **32** invalid one-blob txs per message (to avoid the sleep), the victim does about `32 * 2.5ms = 80ms` of KZG verification work per message.
-*   At 1 Gbps, the attacker can send many such messages per second in bandwidth terms; in practice, throughput is bounded by the victim’s CPU and the number of concurrent peer connections.
-*   With multiple peers, the attacker can drive concurrent KZG verification across cores and significantly degrade block/tx processing.
+*   On this test machine, validating a single blob tx with an invalid proof took ~`1.8ms` (measured via the local harness; see “Local Reproduction (No Network)” below).
+*   If an attacker sends **32** invalid one-blob txs per delivery (to avoid the sleep), the victim does roughly `32 * 1.8ms ≈ 58ms` of KZG verification CPU per delivery per peer.
+*   With multiple peers, the work scales across cores because each peer can drive validation in parallel.
 
 **Real-world Preconditions:**
 *   **Inbound Connectivity:** The victim node must accept inbound P2P connections (default behavior).
@@ -133,19 +138,36 @@ An attacker can flood a victim node with unsolicited `PooledTransactionsMsg` con
 **Severity:**
 **High**. The attack requires no special permissions (just a P2P connection) and can be executed with standard hardware. It causes a Denial of Service (DoS) by exhausting CPU resources.
 
-#### Reproduction Steps
-1. Connect to a victim Geth node using the `eth/68` protocol.
-2. Construct a `PooledTransactionsMsg` (0x0a) containing a batch of blob transactions (e.g., up to ~10 MiB, or smaller batches ≤32 txs to avoid the `200ms` sleep).
-3. For each transaction:
-   - Use a valid format and signature (random key).
-   - Include 1 blob.
-   - Use valid commitments (random points on curve) matching the versioned hashes.
-   - Use a **well-formed but invalid proof**. A practical way is to compute a valid proof for a different `(blob, commitment)` pair and reuse it, so verification still executes the full pairing check before failing.
-   - Encode using the "network encoding" (list of lists) to include the sidecar.
-4. Send the message to the victim without sending a `GetPooledTransactionsMsg` first.
-5. Observe the victim node consuming CPU due to KZG verification and becoming slow/unresponsive at the process level under sustained load.
-6. Repeat continuously.
-*Note: The code below generates a valid proof to demonstrate the packet structure and size. For the exploit, the attacker would modify this to send an invalid proof (e.g., by modifying the blob data after proof generation) to trigger the validation failure.*
+#### Local Reproduction (No Network)
+This repository includes a local-only harness that demonstrates:
+1) invalid blob proofs still trigger expensive KZG verification during txpool stateless validation, and
+2) the fetcher path does not disconnect/ban on repeated invalid proofs.
+
+1. Run a single validation and see the specific error + timing:
+   ```bash
+   go run ./bug-bounty/local_repro -debug
+   ```
+   Expected: `validate_err=invalid blob 0: ...` and `validate_took` on the order of milliseconds.
+   Example output:
+   ```
+   validate_err=invalid blob 0: can't verify opening proof
+   validate_took=1.831875ms
+   ```
+
+2. Run sustained load with multiple “peer” workers and capture a CPU profile:
+   ```bash
+   go run ./bug-bounty/local_repro -duration 15s -peers 8 -txs 32 -cpuprofile cpu.pprof
+   go tool pprof -top cpu.pprof
+   ```
+   Expected: `pprof` output dominated by KZG/BLS12-381 math functions, demonstrating that invalid proofs still force expensive verification work.
+   Example `pprof -top` excerpts:
+   ```
+   github.com/consensys/gnark-crypto/ecc/bls12-381/fp.mul
+   github.com/consensys/gnark-crypto/ecc/bls12-381/fr.mul
+   github.com/crate-crypto/go-eth-kzg/internal/domain.(*Domain).EvaluateLagrangePolynomialWithIndex
+   ```
+
+3. Observe that the harness reports `dropped_peers=0`, matching the code-level behavior that invalid-proof rejections do not lead to disconnect/ban in `TxFetcher.Enqueue`.
 
 
 #### Proof of Concept (Packet Construction)
@@ -175,7 +197,7 @@ The following Go code demonstrates that a `BlobTx` with a sidecar encodes to the
 1.  **Connect:** Attacker connects to victim node using `eth/68`.
 2.  **Send:** Attacker sends unsolicited `PooledTransactionsMsg` (0x0a) containing invalid blob transactions (valid format, well-formed but invalid proof). **No `GetPooledTransactionsMsg` is sent.** To maximize throughput, the attacker can keep deliveries to **≤32 invalid txs per message** (or otherwise keep `otherreject` ≤ 32 per `addTxsBatchSize` batch) to avoid the post-batch `200ms` sleep.
 3.  **Process:** Victim's `handlePooledTransactions` forwards to `TxFetcher`.
-4.  **Verify:** `TxFetcher` calls `BlobPool.Add` -> `preCheck` -> `VerifyBlobProof`.
+4.  **Verify:** `TxFetcher` calls into txpool stateless validation, which performs KZG verification (`kzg4844.VerifyBlobProof`) for legacy blob sidecars.
 5.  **Fail:** Verification fails. `TxFetcher` increments `otherreject`.
 6.  **Repeat:** Attacker sends another batch immediately.
 7.  **Result:** Victim CPU spikes. The peer is **not disconnected** for repeated invalid blob proofs. Any `200ms` sleep is applied only after the expensive validation work is already done, and can be worked around by keeping invalid deliveries under the threshold.
@@ -183,5 +205,3 @@ The following Go code demonstrates that a `BlobTx` with a sidecar encodes to the
 #### Recommendation
 1. **Enforce Request-Response:** Modify `eth/handler_eth.go` or `TxFetcher` to reject `PooledTransactionsMsg` messages that do not correspond to an active request (unless explicitly announced and waiting) *before* calling `addTxs`.
 2. **Drop Malicious Peers:** In `TxFetcher.Enqueue`, if `TxPool.Add` returns a validation error implying malicious intent (like invalid signature or invalid blob proof), immediately **disconnect** the peer.
-
-
